@@ -1,0 +1,3 @@
+/home/ubuntu/Documents/my_test/my_cpu_stress/build/CMakeFiles/cpu_monitor.dir
+/home/ubuntu/Documents/my_test/my_cpu_stress/build/CMakeFiles/edit_cache.dir
+/home/ubuntu/Documents/my_test/my_cpu_stress/build/CMakeFiles/rebuild_cache.dir
