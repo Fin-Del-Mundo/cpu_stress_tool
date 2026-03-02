@@ -16,6 +16,7 @@
 #include <sched.h>
 
 volatile std::sig_atomic_t g_stop = 0;
+static int g_power_percent = 100;  // 全局功率百分比 (0-100), 100 表示跑满
 
 void signal_handler(int signal) {
     g_stop = 1;
@@ -30,11 +31,41 @@ void stress_worker(int core_id) {
     pthread_t thread = pthread_self();
     pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
 
-    while (g_stop == 0) {
-        double x = 0.1;
-        // 增加计算复杂度以确保流水线满载
-        for (int i = 0; i < 5000; ++i) {
-            x = std::sin(x) * std::cos(x) + std::tan(x);
+    // 如果功率百分比为 100，则跑满
+    if (g_power_percent >= 100) {
+        while (g_stop == 0) {
+            double x = 0.1;
+            // 增加计算复杂度以确保流水线满载
+            for (int i = 0; i < 5000; ++i) {
+                x = std::sin(x) * std::cos(x) + std::tan(x);
+            }
+        }
+    } else {
+        // 按百分比功率运行：工作一段时间，然后休眠
+        // 使用循环周期为 100ms，工作时间比例为 power_percent%
+        int cycle_ms = 100;  // 每个完整周期 100ms
+        int work_ms = (g_power_percent * cycle_ms) / 100;
+        auto cycle_duration = std::chrono::milliseconds(cycle_ms);
+        
+        while (g_stop == 0) {
+            auto cycle_start = std::chrono::steady_clock::now();
+            
+            // 在 work_ms 内执行计算
+            auto work_end = cycle_start + std::chrono::milliseconds(work_ms);
+            while (std::chrono::steady_clock::now() < work_end && g_stop == 0) {
+                double x = 0.1;
+                for (int i = 0; i < 5000; ++i) {
+                    x = std::sin(x) * std::cos(x) + std::tan(x);
+                }
+            }
+            
+            // 剩余时间休眠
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - cycle_start);
+            if (elapsed < cycle_duration) {
+                auto remaining = cycle_duration - elapsed;
+                std::this_thread::sleep_for(remaining);
+            }
         }
     }
 }
@@ -214,6 +245,21 @@ int main(int argc, char* argv[]) {
             cores_str = arg.substr(8);  // 提取 "--cores=" 后的内容
             core_config.use_all_cores = false;
         }
+        if (arg.find("--power=") == 0) {
+            std::string power_str = arg.substr(8);  // 提取 "--power=" 后的内容
+            try {
+                int power = std::stoi(power_str);
+                if (power >= 0 && power <= 100) {
+                    g_power_percent = power;
+                } else {
+                    std::cerr << "Error: Power percentage must be between 0 and 100!\n";
+                    return 1;
+                }
+            } catch (...) {
+                std::cerr << "Error: Invalid power value!\n";
+                return 1;
+            }
+        }
     }
     
     // 输出使用帮助
@@ -221,9 +267,14 @@ int main(int argc, char* argv[]) {
         std::cout << "Usage: " << argv[0] << " [options]\n"
                   << "Options:\n"
                   << "  --cores=LIST         Specify CPU cores to stress test (e.g., --cores=0,1,2 or --cores=0-3)\n"
+                  << "  --power=PERCENT      Set CPU power usage percentage (0-100, default: 100 for full power)\n"
                   << "  --plot               Generate plots with matplotlib\n"
                   << "  --no-csv             Skip CSV export\n"
-                  << "  --help, -h           Show this help message\n";
+                  << "  --help, -h           Show this help message\n"
+                  << "\nExamples:\n"
+                  << "  " << argv[0] << "                    # Use all cores at 100% power\n"
+                  << "  " << argv[0] << " --power=50           # Use all cores at 50% power\n"
+                  << "  " << argv[0] << " --cores=0-3 --power=75  # Use cores 0-3 at 75% power\n";
         return 0;
     }
 
@@ -261,6 +312,11 @@ int main(int argc, char* argv[]) {
         std::cout << test_cores[i];
     }
     std::cout << "\n";
+    if (g_power_percent == 100) {
+        std::cout << "Power mode: Full power (100%)\n";
+    } else {
+        std::cout << "Power mode: " << g_power_percent << "% power\n";
+    }
     std::cout << "Starting stress test... Press [Ctrl+C] to stop and generate plots.\n";
 
     // 数据存储容器 (用于 Matplotlib 绘图)
