@@ -92,6 +92,7 @@ cpu_monitor_EXTERNAL_OBJECTS =
 
 cpu_monitor: CMakeFiles/cpu_monitor.dir/cpu_monitor.cpp.o
 cpu_monitor: CMakeFiles/cpu_monitor.dir/build.make
+cpu_monitor: /usr/lib/x86_64-linux-gnu/libpython3.10.so
 cpu_monitor: CMakeFiles/cpu_monitor.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/ubuntu/Documents/my_test/my_cpu_stress/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CXX executable cpu_monitor"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/cpu_monitor.dir/link.txt --verbose=$(VERBOSE)

@@ -1,1 +1,1 @@
-/usr/bin/c++ CMakeFiles/cpu_monitor.dir/cpu_monitor.cpp.o -o cpu_monitor 
+/usr/bin/c++ CMakeFiles/cpu_monitor.dir/cpu_monitor.cpp.o -o cpu_monitor  /usr/lib/x86_64-linux-gnu/libpython3.10.so 

@@ -14,6 +14,15 @@
 #include <cstdlib>
 #include <pthread.h>
 #include <sched.h>
+#include <filesystem>
+#include <map>
+#include <numeric>
+#include <deque>
+
+#ifdef ENABLE_MATPLOTLIB_CPP
+#include "matplotlibcpp.h"  // C++ matplotlib 绑定
+namespace plt = matplotlibcpp;
+#endif
 
 volatile std::sig_atomic_t g_stop = 0;
 static int g_power_percent = 100;  // 全局功率百分比 (0-100), 100 表示跑满
@@ -23,7 +32,7 @@ void signal_handler(int signal) {
 }
 
 // --- 压力测试模块 ---
-void stress_worker(int core_id) {
+void stress_worker(int core_id, int total_threads, int thread_index) {
     // 将当前线程绑定到指定的 CPU 核心上，确保只有所需的核心跑满载
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -35,36 +44,38 @@ void stress_worker(int core_id) {
     if (g_power_percent >= 100) {
         while (g_stop == 0) {
             double x = 0.1;
-            // 增加计算复杂度以确保流水线满载
             for (int i = 0; i < 5000; ++i) {
                 x = std::sin(x) * std::cos(x) + std::tan(x);
             }
         }
     } else {
-        // 按百分比功率运行：工作一段时间，然后休眠
-        // 使用循环周期为 100ms，工作时间比例为 power_percent%
-        int cycle_ms = 100;  // 每个完整周期 100ms
-        int work_ms = (g_power_percent * cycle_ms) / 100;
-        auto cycle_duration = std::chrono::milliseconds(cycle_ms);
-        
+        // 使用更精细的负载控制方式
+        // 原理：在小的周期内精确控制工作和休眠时间比例
+        // 同时错开各线程的周期，避免同步导致的负载波动
+
+        const int cycle_us = 1000;  // 1ms 周期
+        int work_us = (g_power_percent * cycle_us) / 100;
+        int sleep_us = cycle_us - work_us;
+
+        // 计算线程的初始偏移量，使各线程的工作周期错开
+        int offset_us = (thread_index * cycle_us) / total_threads;
+        std::this_thread::sleep_for(std::chrono::microseconds(offset_us));
+
         while (g_stop == 0) {
-            auto cycle_start = std::chrono::steady_clock::now();
-            
-            // 在 work_ms 内执行计算
-            auto work_end = cycle_start + std::chrono::milliseconds(work_ms);
-            while (std::chrono::steady_clock::now() < work_end && g_stop == 0) {
+            auto start = std::chrono::steady_clock::now();
+
+            // 工作阶段
+            auto work_end_time = start + std::chrono::microseconds(work_us);
+            while (std::chrono::steady_clock::now() < work_end_time && g_stop == 0) {
                 double x = 0.1;
-                for (int i = 0; i < 5000; ++i) {
+                for (int i = 0; i < 1000; ++i) {
                     x = std::sin(x) * std::cos(x) + std::tan(x);
                 }
             }
-            
-            // 剩余时间休眠
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - cycle_start);
-            if (elapsed < cycle_duration) {
-                auto remaining = cycle_duration - elapsed;
-                std::this_thread::sleep_for(remaining);
+
+            // 休眠阶段
+            if (sleep_us > 0 && g_stop == 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
             }
         }
     }
@@ -110,88 +121,247 @@ double get_cpu_freq_mhz(int core_id) {
     return freq_khz / 1000.0;
 }
 
-// 获取 CPU 温度 (单位: 摄氏度)
-// 支持多个温度源: 全局温度 + 每个核心的独立温度
-double get_cpu_temp() {
-    // 优先使用 hwmon 接口 - 收集所有温度传感器并求平均
-    // 这样可以得到更全面的温度信息，包括各个核心的温度
-    std::vector<double> collected_temps;
-    for (int hwmon_idx = 0; hwmon_idx < 15; ++hwmon_idx) {
-        for (int temp_idx = 1; temp_idx <= 20; ++temp_idx) {
-            std::string hwmon_path = "/sys/class/hwmon/hwmon" + std::to_string(hwmon_idx) + 
-                                    "/temp" + std::to_string(temp_idx) + "_input";
-            std::ifstream hwmon_file(hwmon_path);
-            if (hwmon_file.is_open()) {
-                double temp = 0.0;
-                if (hwmon_file >> temp) {
-                    temp = temp / 1000.0;
-                    if (temp > 0 && temp < 150) {
-                        collected_temps.push_back(temp);
+// 温度平滑处理器
+class TemperatureSmoother {
+private:
+    double smoothed_temp_ = 0.0;
+    bool initialized_ = false;
+    std::deque<double> history_;
+    int window_size_ = 5;
+    double alpha_ = 0.3;  // EMA 系数
+    double max_jump_ = 15.0;  // 最大单次跳变限制
+
+public:
+    double smooth(double raw_temp) {
+        if (raw_temp <= 0) return smoothed_temp_;
+
+        if (!initialized_) {
+            smoothed_temp_ = raw_temp;
+            history_.push_back(raw_temp);
+            initialized_ = true;
+            return smoothed_temp_;
+        }
+
+        // 异常值限制
+        double temp_diff = raw_temp - smoothed_temp_;
+        double limited_temp;
+        if (std::abs(temp_diff) > max_jump_) {
+            double sign = (temp_diff > 0) ? 1.0 : -1.0;
+            limited_temp = smoothed_temp_ + sign * max_jump_;
+        } else {
+            limited_temp = raw_temp;
+        }
+
+        // 更新滑动窗口
+        history_.push_back(limited_temp);
+        if (history_.size() > static_cast<size_t>(window_size_)) {
+            history_.pop_front();
+        }
+
+        // 计算窗口平均值
+        double window_avg = 0.0;
+        if (!history_.empty()) {
+            window_avg = std::accumulate(history_.begin(), history_.end(), 0.0) / history_.size();
+        }
+
+        // 结合 EMA 和滑动窗口平均
+        smoothed_temp_ = alpha_ * window_avg + (1.0 - alpha_) * smoothed_temp_;
+        return smoothed_temp_;
+    }
+};
+
+// 全局温度平滑器
+static TemperatureSmoother g_temp_smoother;
+
+// 通过 coretemp 驱动获取各核心温度
+// 返回: map<核心标签, 温度值>，如 {"Core 0": 45.0, "Package id 0": 50.0}
+std::map<std::string, double> get_core_temperatures() {
+    std::map<std::string, double> core_temps;
+    namespace fs = std::filesystem;
+    std::string hwmon_base = "/sys/class/hwmon";
+
+    try {
+        if (fs::exists(hwmon_base)) {
+            for (const auto& hwmon_entry : fs::directory_iterator(hwmon_base)) {
+                if (!hwmon_entry.is_directory()) continue;
+
+                std::string hwmon_dir = hwmon_entry.path().string();
+                std::string name_file = hwmon_dir + "/name";
+
+                // 检查驱动名称是否为 coretemp
+                if (fs::exists(name_file)) {
+                    std::ifstream name_stream(name_file);
+                    std::string driver_name;
+
+                    if (std::getline(name_stream, driver_name)) {
+                        // 去除末尾空白
+                        driver_name.erase(driver_name.find_last_not_of(" \n\r\t") + 1);
+
+                        if (driver_name == "coretemp") {
+                            // 遍历目录下的所有 temp*_label 文件
+                            for (const auto& temp_entry : fs::directory_iterator(hwmon_dir)) {
+                                std::string entry_name = temp_entry.path().filename().string();
+
+                                // 查找 temp*_label 文件
+                                if (entry_name.find("temp") == 0 &&
+                                    entry_name.find("_label") != std::string::npos) {
+
+                                    std::string label_file = temp_entry.path().string();
+                                    std::ifstream label_stream(label_file);
+                                    std::string label;
+
+                                    if (std::getline(label_stream, label)) {
+                                        label.erase(label.find_last_not_of(" \n\r\t") + 1);
+
+                                        // 构造对应的 _input 文件名
+                                        std::string input_file = label_file;
+                                        size_t label_pos = input_file.find("_label");
+                                        if (label_pos != std::string::npos) {
+                                            input_file.replace(label_pos, 6, "_input");
+
+                                            if (fs::exists(input_file)) {
+                                                std::ifstream input_stream(input_file);
+                                                int64_t raw_temp = 0;
+
+                                                if (input_stream >> raw_temp) {
+                                                    double temp_c = raw_temp / 1000.0;
+                                                    core_temps[label] = temp_c;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+    } catch (const std::exception& e) {
+        // 静默处理错误
     }
-    
-    // 如果找到了有效的温度传感器，返回平均值
-    if (!collected_temps.empty()) {
-        double sum = 0.0;
-        for (double t : collected_temps) sum += t;
-        return sum / collected_temps.size();
+
+    return core_temps;
+}
+
+// 检查 thermal_zone type 是否为 CPU 温度类型
+static bool is_cpu_temp_type(const std::string& type) {
+    // 常见的 CPU 温度类型标识
+    static const std::vector<std::string> cpu_types = {
+        "x86_pkg_temp",   // x86 CPU 包温度
+        "cpu",            // 通用 CPU 标识
+        "coretemp",       // coretemp 驱动
+        "cpu_thermal",    // ARM CPU 热传感器
+        "soc_thermal",    // SoC 热传感器
+    };
+
+    std::string lower_type = type;
+    std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(), ::tolower);
+
+    for (const auto& cpu_type : cpu_types) {
+        if (lower_type.find(cpu_type) != std::string::npos) {
+            return true;
+        }
     }
-    
-    // 备用方案: /sys/class/thermal/thermal_zone0/temp
-    {
-        std::ifstream file("/sys/class/thermal/thermal_zone0/temp");
-        if (file.is_open()) {
-            double temp = 0.0;
-            if (file >> temp) {
-                return temp / 1000.0;
+    return false;
+}
+
+// 从 thermal_zone 获取 CPU 温度（备用方案）
+static double get_cpu_temp_from_thermal_zone() {
+    namespace fs = std::filesystem;
+    std::string tz_base = "/sys/class/thermal";
+
+    try {
+        if (fs::exists(tz_base)) {
+            for (const auto& tz_entry : fs::directory_iterator(tz_base)) {
+                if (!tz_entry.is_directory()) continue;
+
+                std::string tz_dir = tz_entry.path().string();
+                std::string type_file = tz_dir + "/type";
+                std::string temp_file = tz_dir + "/temp";
+
+                if (fs::exists(type_file) && fs::exists(temp_file)) {
+                    std::ifstream type_stream(type_file);
+                    std::string type;
+                    if (std::getline(type_stream, type)) {
+                        type.erase(type.find_last_not_of(" \n\r\t") + 1);
+
+                        if (is_cpu_temp_type(type)) {
+                            std::ifstream temp_stream(temp_file);
+                            int64_t raw_temp = 0;
+                            if (temp_stream >> raw_temp) {
+                                double temp_c = raw_temp / 1000.0;
+                                if (temp_c > 0 && temp_c < 150) {
+                                    return temp_c;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        // 静默处理
+    }
+
+    return 0.0;
+}
+
+// 获取 CPU 平均温度 (单位: 摄氏度)
+double get_cpu_temp() {
+    std::vector<double> valid_temps;
+
+    // 优先从 coretemp 驱动读取核心温度
+    auto core_temps = get_core_temperatures();
+
+    if (!core_temps.empty()) {
+        for (const auto& [label, temp] : core_temps) {
+            if (label.find("Core") != std::string::npos ||
+                label.find("Package") != std::string::npos) {
+                if (temp > 0 && temp < 150) {
+                    valid_temps.push_back(temp);
+                }
             }
         }
     }
-    
+
+    // 如果 coretemp 未找到，尝试 thermal_zone
+    if (valid_temps.empty()) {
+        double tz_temp = get_cpu_temp_from_thermal_zone();
+        if (tz_temp > 0) {
+            valid_temps.push_back(tz_temp);
+        }
+    }
+
+    // 计算平均温度
+    if (!valid_temps.empty()) {
+        double sum = std::accumulate(valid_temps.begin(), valid_temps.end(), 0.0);
+        double avg_temp = sum / valid_temps.size();
+
+        // 应用温度平滑
+        return g_temp_smoother.smooth(avg_temp);
+    }
+
     return 0.0;
 }
 
 // 获取单个核心的温度 (单位: 摄氏度)
 double get_core_temp(int core_id) {
-    // 尝试直接对应核心的温度传感器
-    // 对于多核系统，核心 i 的温度通常在 temp(i+2)_input
-    for (int hwmon_idx = 0; hwmon_idx < 20; ++hwmon_idx) {
-        std::string sensor_path = "/sys/class/hwmon/hwmon" + std::to_string(hwmon_idx) + 
-                                 "/temp" + std::to_string(core_id + 2) + "_input";
-        std::ifstream sensor_file(sensor_path);
-        if (sensor_file.is_open()) {
-            double temp = 0.0;
-            if (sensor_file >> temp) {
-                temp = temp / 1000.0;
-                if (temp > 0 && temp < 150) {  // 合理的温度范围
-                    return temp;
-                }
-            }
+    auto core_temps = get_core_temperatures();
+
+    // 尝试匹配 "Core N" 标签
+    std::string target_label = "Core " + std::to_string(core_id);
+    if (core_temps.find(target_label) != core_temps.end()) {
+        return core_temps[target_label];
+    }
+
+    // 备用: 如果找不到特定核心温度，返回 Package 温度
+    for (const auto& [label, temp] : core_temps) {
+        if (label.find("Package") != std::string::npos) {
+            return temp;
         }
     }
-    
-    // 如果找不到核心特定的温度，尝试通用传感器
-    for (int hwmon_idx = 0; hwmon_idx < 10; ++hwmon_idx) {
-        for (int temp_idx = 1; temp_idx <= 20; ++temp_idx) {
-            std::string sensor_path = "/sys/class/hwmon/hwmon" + std::to_string(hwmon_idx) + 
-                                     "/temp" + std::to_string(temp_idx) + "_input";
-            std::ifstream sensor_file(sensor_path);
-            if (sensor_file.is_open()) {
-                double temp = 0.0;
-                if (sensor_file >> temp) {
-                    temp = temp / 1000.0;
-                    if (temp > 0 && temp < 150) {  // 合理的温度范围
-                        return temp;
-                    }
-                }
-            }
-        }
-    }
-    
-    // 如果找不到核心特定的温度，返回0
+
     return 0.0;
 }
 
@@ -226,20 +396,15 @@ std::vector<int> parse_cores(const std::string& cores_str, int max_cores) {
 }
 
 int main(int argc, char* argv[]) {
-    // 在任何其他操作之前，设置matplotlib后端
-#ifdef ENABLE_MATPLOTLIB
-    setenv("MPLBACKEND", "Agg", 1);
-#endif
-    
     // 解析命令行参数
-    bool enable_plot = false;
+    bool enable_plot = true;  // 默认生成图像
     bool enable_csv = true;
     CoreConfig core_config;
     std::string cores_str;
-    
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--plot") enable_plot = true;
+        if (arg == "--no-plot") enable_plot = false;
         if (arg == "--no-csv") enable_csv = false;
         if (arg.find("--cores=") == 0) {
             cores_str = arg.substr(8);  // 提取 "--cores=" 后的内容
@@ -261,14 +426,14 @@ int main(int argc, char* argv[]) {
             }
         }
     }
-    
+
     // 输出使用帮助
     if (argc > 1 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         std::cout << "Usage: " << argv[0] << " [options]\n"
                   << "Options:\n"
                   << "  --cores=LIST         Specify CPU cores to stress test (e.g., --cores=0,1,2 or --cores=0-3)\n"
                   << "  --power=PERCENT      Set CPU power usage percentage (0-100, default: 100 for full power)\n"
-                  << "  --plot               Generate plots with matplotlib\n"
+                  << "  --no-plot            Skip plot generation\n"
                   << "  --no-csv             Skip CSV export\n"
                   << "  --help, -h           Show this help message\n"
                   << "\nExamples:\n"
@@ -278,13 +443,6 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-#ifndef ENABLE_MATPLOTLIB
-    if (enable_plot) {
-        std::cerr << "Warning: matplotlib support is not compiled. Skipping plot generation.\n";
-        enable_plot = false;
-    }
-#endif
-    
     // 注册 Ctrl+C 信号
     std::signal(SIGINT, signal_handler);
 
@@ -302,6 +460,68 @@ int main(int argc, char* argv[]) {
         if (test_cores.empty()) {
             std::cerr << "Error: No valid cores specified!\n";
             return 1;
+        }
+    }
+
+    // --- 设置 CPU Governor 为 performance 模式 ---
+    // 这是解决频率跳变的关键：powersave 模式会根据负载动态调整频率
+    // performance 模式会锁定频率在最大值，保证稳定
+    std::string original_governor;
+    bool governor_changed = false;
+
+    {
+        // 读取当前 governor（从 cpu0）
+        std::ifstream gov_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+        if (gov_file.is_open()) {
+            std::getline(gov_file, original_governor);
+            // 去除空白
+            original_governor.erase(original_governor.find_last_not_of(" \n\r\t") + 1);
+        }
+
+        if (original_governor != "performance") {
+            // 尝试为所有核心设置 performance governor
+            bool all_success = true;
+            for (int i = 0; i < num_cores; ++i) {
+                std::string gov_path = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_governor";
+                std::ofstream set_gov(gov_path);
+                if (set_gov.is_open()) {
+                    set_gov << "performance";
+                    set_gov.close();
+                } else {
+                    all_success = false;
+                }
+            }
+
+            if (all_success) {
+                // 验证是否设置成功
+                bool verified = true;
+                for (int i = 0; i < num_cores; ++i) {
+                    std::string gov_path = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_governor";
+                    std::ifstream check_gov(gov_path);
+                    std::string new_gov;
+                    if (check_gov.is_open() && std::getline(check_gov, new_gov)) {
+                        new_gov.erase(new_gov.find_last_not_of(" \n\r\t") + 1);
+                        if (new_gov != "performance") {
+                            verified = false;
+                            break;
+                        }
+                    } else {
+                        verified = false;
+                        break;
+                    }
+                }
+
+                if (verified) {
+                    governor_changed = true;
+                    std::cout << "CPU Governor set to 'performance' mode for all " << num_cores << " cores (was: " << original_governor << ")\n";
+                }
+            }
+
+            if (!governor_changed) {
+                std::cout << "Warning: Could not set CPU governor to 'performance'.\n";
+                std::cout << "         CPU frequency may fluctuate. Run with 'sudo' to enable performance mode.\n";
+                std::cout << "         Or manually run: sudo cpupower frequency-set -g performance\n";
+            }
         }
     }
 
@@ -332,9 +552,12 @@ int main(int argc, char* argv[]) {
 
     // 启动压力线程 (仅在指定的核心上运行)
     std::vector<std::thread> threads;
-    for (int core_id : test_cores) {
+    int total_threads = test_cores.size();
+    for (int i = 0; i < total_threads; ++i) {
+        int core_id = test_cores[i];
         // stress_worker 会将线程绑定到 core_id
-        threads.emplace_back(stress_worker, core_id);
+        // 传入 total_threads 和线程索引 i 用于错开工作周期
+        threads.emplace_back(stress_worker, core_id, total_threads, i);
     }
 
     auto prev_stats = read_cpu_stats();
@@ -517,49 +740,129 @@ int main(int argc, char* argv[]) {
         std::cout << "CSV file saved successfully.\n";
     }
 
-    // --- Matplotlib 绘图部分 (可选) ---
-#ifdef ENABLE_MATPLOTLIB
+    // --- matplotlibcpp 绘图 ---
+#ifdef ENABLE_MATPLOTLIB_CPP
     if (enable_plot && !time_log.empty()) {
-        std::cout << "Generating plots with matplotlib...\n";
-        
+        std::cout << "\nGenerating plot with matplotlib...\n";
+
         try {
-            // 获取当前可执行文件所在目录
-            char exe_path[1024];
-            ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-            std::string script_dir = "/home/ubuntu/Documents/my_test/my_cpu_stress";
-            
-            if (len != -1) {
-                exe_path[len] = '\0';
-                std::string exe_str(exe_path);
-                size_t last_slash = exe_str.rfind('/');
-                if (last_slash != std::string::npos) {
-                    // 假设脚本在源目录中
-                    script_dir = exe_str.substr(0, last_slash);
-                    // 返回上一级目录（从build到源目录）
-                    last_slash = script_dir.rfind('/');
-                    if (last_slash != std::string::npos && script_dir.substr(last_slash) == "/build") {
-                        script_dir = script_dir.substr(0, last_slash);
+            // 设置非交互式后端（必须在其他 matplotlib 调用之前）
+            plt::backend("Agg");
+
+            // 创建图形
+            plt::figure_size(1200, 900);
+
+            // 颜色循环（会循环使用）
+            std::vector<std::string> colors = {"C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"};
+
+            // 确定要显示的核心：如果指定了 --cores 就只显示指定的，否则显示全部
+            std::vector<int> cores_to_display;
+            if (core_config.use_all_cores) {
+                for (int i = 0; i < num_cores; ++i) cores_to_display.push_back(i);
+            } else {
+                cores_to_display = test_cores;
+            }
+
+            // 子图1: CPU 使用率 (使用 subplot2grid 替代 subplot)
+            plt::subplot2grid(4, 1, 0, 0);
+            for (size_t idx = 0; idx < cores_to_display.size(); ++idx) {
+                int core_id = cores_to_display[idx];
+                if (core_id < num_cores && !usage_logs[core_id].empty()) {
+                    plt::named_plot("Core " + std::to_string(core_id), time_log, usage_logs[core_id], colors[idx % colors.size()]);
+                }
+            }
+            plt::title("CPU Core Usage History");
+            plt::ylabel("Usage (%)");
+            plt::ylim(-5.0, 105.0);
+            plt::legend();
+            plt::grid(true);
+
+            // 子图2: CPU 频率
+            plt::subplot2grid(4, 1, 1, 0);
+            double freq_max = 0;
+            for (int core_id : cores_to_display) {
+                if (core_id < num_cores) {
+                    for (double f : freq_logs[core_id]) freq_max = std::max(freq_max, f);
+                }
+            }
+            freq_max = std::max(freq_max, 1000.0);
+            for (size_t idx = 0; idx < cores_to_display.size(); ++idx) {
+                int core_id = cores_to_display[idx];
+                if (core_id < num_cores && !freq_logs[core_id].empty()) {
+                    plt::named_plot("Core " + std::to_string(core_id), time_log, freq_logs[core_id], colors[idx % colors.size()]);
+                }
+            }
+            plt::title("CPU Core Frequency History");
+            plt::ylabel("Frequency (MHz)");
+            plt::ylim(0.0, freq_max);
+            plt::grid(true);
+
+            // 子图3: 核心温度
+            plt::subplot2grid(4, 1, 2, 0);
+            double temp_min = 200, temp_max = 0;
+            for (int core_id : cores_to_display) {
+                if (core_id < num_cores) {
+                    for (double t : core_temp_logs[core_id]) {
+                        if (t > 0) { temp_min = std::min(temp_min, t); temp_max = std::max(temp_max, t); }
                     }
                 }
             }
-            
-            std::string plot_script = "python3 \"" + script_dir + "/plot_data.py\" \"cpu_stress_result.csv\" \"cpu_stress_result.png\"";
-            std::cout << "Running: " << plot_script << "\n";
-            int result = std::system(plot_script.c_str());
-            
-            if (result == 0) {
-                std::cout << "Plot generated successfully.\n";
-            } else {
-                std::cerr << "Warning: Failed to generate matplotlib plot (exit code: " << result << ")\n";
-                std::cerr << "You can manually run: python3 " << script_dir << "/plot_data.py cpu_stress_result.csv\n";
+            if (temp_max == 0) { temp_min = 20; temp_max = 100; }
+            for (size_t idx = 0; idx < cores_to_display.size(); ++idx) {
+                int core_id = cores_to_display[idx];
+                if (core_id < num_cores && !core_temp_logs[core_id].empty()) {
+                    plt::named_plot("Core " + std::to_string(core_id), time_log, core_temp_logs[core_id], colors[idx % colors.size()]);
+                }
             }
+            plt::title("Per-Core Temperature History");
+            plt::ylabel("Temperature (C)");
+            plt::ylim(temp_min - 5, temp_max + 5);
+            plt::grid(true);
+
+            // 子图4: 总体温度
+            plt::subplot2grid(4, 1, 3, 0);
+            if (!temp_logs.empty()) {
+                plt::named_plot("CPU Temp", time_log, temp_logs, "r");
+            }
+            plt::title("Overall CPU Temperature History");
+            plt::ylabel("Temperature (C)");
+            plt::xlabel("Time (s)");
+            plt::grid(true);
+
+            plt::suptitle("CPU Stress Test Results");
+            plt::tight_layout();
+            plt::save("cpu_stress_result.png");
+            plt::close();
+
+            std::cout << "Plot saved to cpu_stress_result.png\n";
         } catch (const std::exception& e) {
-            std::cerr << "Warning: Failed to generate matplotlib plot: " << e.what() << "\n";
+            std::cerr << "Error generating plot: " << e.what() << "\n";
         }
+    }
+#else
+    if (enable_plot) {
+        std::cout << "\nNote: matplotlibcpp is not available. Plot generation is disabled.\n";
     }
 #endif
 
-    std::cout << "\nDone!\n"; 
+    // --- 恢复 CPU Governor 设置 ---
+    if (governor_changed && !original_governor.empty()) {
+        bool restore_success = true;
+        for (int i = 0; i < num_cores; ++i) {
+            std::string gov_path = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_governor";
+            std::ofstream set_gov(gov_path);
+            if (set_gov.is_open()) {
+                set_gov << original_governor;
+            } else {
+                restore_success = false;
+            }
+        }
+        if (restore_success) {
+            std::cout << "CPU Governor restored to '" << original_governor << "' for all " << num_cores << " cores\n";
+        }
+    }
+
+    std::cout << "\nDone!\n";
 
     return 0;
 }
