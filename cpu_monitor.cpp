@@ -25,58 +25,25 @@ namespace plt = matplotlibcpp;
 #endif
 
 volatile std::sig_atomic_t g_stop = 0;
-static int g_power_percent = 100;  // 全局功率百分比 (0-100), 100 表示跑满
+static int g_power_percent = 100;  // 全局功率百分比 (0-100): 通过锁定 CPU 频率到该百分比来控制功耗
 
 void signal_handler(int signal) {
     g_stop = 1;
 }
 
 // --- 压力测试模块 ---
+// worker 始终满载运行。功耗由锁定的 CPU 频率决定（见 main 中的频率控制逻辑）。
 void stress_worker(int core_id, int total_threads, int thread_index) {
-    // 将当前线程绑定到指定的 CPU 核心上，确保只有所需的核心跑满载
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core_id, &cpuset);
     pthread_t thread = pthread_self();
     pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
 
-    // 如果功率百分比为 100，则跑满
-    if (g_power_percent >= 100) {
-        while (g_stop == 0) {
-            double x = 0.1;
-            for (int i = 0; i < 5000; ++i) {
-                x = std::sin(x) * std::cos(x) + std::tan(x);
-            }
-        }
-    } else {
-        // 使用更精细的负载控制方式
-        // 原理：在小的周期内精确控制工作和休眠时间比例
-        // 同时错开各线程的周期，避免同步导致的负载波动
-
-        const int cycle_us = 1000;  // 1ms 周期
-        int work_us = (g_power_percent * cycle_us) / 100;
-        int sleep_us = cycle_us - work_us;
-
-        // 计算线程的初始偏移量，使各线程的工作周期错开
-        int offset_us = (thread_index * cycle_us) / total_threads;
-        std::this_thread::sleep_for(std::chrono::microseconds(offset_us));
-
-        while (g_stop == 0) {
-            auto start = std::chrono::steady_clock::now();
-
-            // 工作阶段
-            auto work_end_time = start + std::chrono::microseconds(work_us);
-            while (std::chrono::steady_clock::now() < work_end_time && g_stop == 0) {
-                double x = 0.1;
-                for (int i = 0; i < 1000; ++i) {
-                    x = std::sin(x) * std::cos(x) + std::tan(x);
-                }
-            }
-
-            // 休眠阶段
-            if (sleep_us > 0 && g_stop == 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
-            }
+    while (g_stop == 0) {
+        double x = 0.1;
+        for (int i = 0; i < 5000; ++i) {
+            x = std::sin(x) * std::cos(x) + std::tan(x);
         }
     }
 }
@@ -114,11 +81,26 @@ std::vector<CpuRawData> read_cpu_stats() {
 }
 
 double get_cpu_freq_mhz(int core_id) {
-    std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(core_id) + "/cpufreq/scaling_cur_freq";
-    std::ifstream file(path);
-    double freq_khz = 0;
-    if (file.is_open()) file >> freq_khz;
-    return freq_khz / 1000.0;
+    std::string cpu_base = "/sys/devices/system/cpu/cpu" + std::to_string(core_id) + "/cpufreq/";
+    // 不同平台/驱动暴露的频率节点不同, 依次尝试:
+    //   scaling_cur_freq : 通用 (governor 请求频率)
+    //   cpuinfo_cur_freq : 实际硬件频率 (部分平台需 root)
+    // NVIDIA Tegra/Thor 在 cpufreq 不可用时, 频率位于 policy 节点
+    std::vector<std::string> candidates = {
+        cpu_base + "scaling_cur_freq",
+        cpu_base + "cpuinfo_cur_freq",
+        "/sys/devices/system/cpu/cpufreq/policy" + std::to_string(core_id) + "/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpufreq/policy" + std::to_string(core_id) + "/cpuinfo_cur_freq",
+    };
+
+    for (const auto& path : candidates) {
+        std::ifstream file(path);
+        double freq_khz = 0;
+        if (file.is_open() && (file >> freq_khz) && freq_khz > 0) {
+            return freq_khz / 1000.0;  // cpufreq 单位为 kHz
+        }
+    }
+    return 0.0;
 }
 
 // 温度平滑处理器
@@ -173,65 +155,104 @@ public:
 // 全局温度平滑器
 static TemperatureSmoother g_temp_smoother;
 
-// 通过 coretemp 驱动获取各核心温度
-// 返回: map<核心标签, 温度值>，如 {"Core 0": 45.0, "Package id 0": 50.0}
+// 检查 hwmon 驱动名称是否为 CPU 温度相关
+static bool is_cpu_hwmon_driver(const std::string& name) {
+    static const std::vector<std::string> cpu_drivers = {
+        "coretemp",       // x86 Intel
+        "k10temp",        // x86 AMD
+        "cpu_thermal",    // ARM 通用
+        "nct6775",        // Nuvoton (some x86 boards)
+    };
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    for (const auto& d : cpu_drivers) {
+        if (lower.find(d) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// 通过 hwmon 驱动获取各核心/传感器温度
+// x86: coretemp 驱动, 标签如 "Core 0", "Package id 0"
+// ARM: cpu_thermal 等驱动, 标签可能为 "CPU-therm" 或传感器编号
 std::map<std::string, double> get_core_temperatures() {
     std::map<std::string, double> core_temps;
     namespace fs = std::filesystem;
     std::string hwmon_base = "/sys/class/hwmon";
 
     try {
-        if (fs::exists(hwmon_base)) {
-            for (const auto& hwmon_entry : fs::directory_iterator(hwmon_base)) {
-                if (!hwmon_entry.is_directory()) continue;
+        if (!fs::exists(hwmon_base)) return core_temps;
 
-                std::string hwmon_dir = hwmon_entry.path().string();
-                std::string name_file = hwmon_dir + "/name";
+        for (const auto& hwmon_entry : fs::directory_iterator(hwmon_base)) {
+            if (!hwmon_entry.is_directory()) continue;
 
-                // 检查驱动名称是否为 coretemp
-                if (fs::exists(name_file)) {
-                    std::ifstream name_stream(name_file);
-                    std::string driver_name;
+            std::string hwmon_dir = hwmon_entry.path().string();
+            std::string name_file = hwmon_dir + "/name";
 
-                    if (std::getline(name_stream, driver_name)) {
-                        // 去除末尾空白
-                        driver_name.erase(driver_name.find_last_not_of(" \n\r\t") + 1);
+            if (!fs::exists(name_file)) continue;
 
-                        if (driver_name == "coretemp") {
-                            // 遍历目录下的所有 temp*_label 文件
-                            for (const auto& temp_entry : fs::directory_iterator(hwmon_dir)) {
-                                std::string entry_name = temp_entry.path().filename().string();
+            std::ifstream name_stream(name_file);
+            std::string driver_name;
+            if (!std::getline(name_stream, driver_name)) continue;
+            driver_name.erase(driver_name.find_last_not_of(" \n\r\t") + 1);
 
-                                // 查找 temp*_label 文件
-                                if (entry_name.find("temp") == 0 &&
-                                    entry_name.find("_label") != std::string::npos) {
+            if (!is_cpu_hwmon_driver(driver_name)) continue;
 
-                                    std::string label_file = temp_entry.path().string();
-                                    std::ifstream label_stream(label_file);
-                                    std::string label;
+            for (const auto& temp_entry : fs::directory_iterator(hwmon_dir)) {
+                std::string entry_name = temp_entry.path().filename().string();
 
-                                    if (std::getline(label_stream, label)) {
-                                        label.erase(label.find_last_not_of(" \n\r\t") + 1);
+                // 优先使用 temp*_label + temp*_input 组合
+                if (entry_name.find("temp") == 0 &&
+                    entry_name.find("_label") != std::string::npos) {
 
-                                        // 构造对应的 _input 文件名
-                                        std::string input_file = label_file;
-                                        size_t label_pos = input_file.find("_label");
-                                        if (label_pos != std::string::npos) {
-                                            input_file.replace(label_pos, 6, "_input");
+                    std::string label_file = temp_entry.path().string();
+                    std::ifstream label_stream(label_file);
+                    std::string label;
 
-                                            if (fs::exists(input_file)) {
-                                                std::ifstream input_stream(input_file);
-                                                int64_t raw_temp = 0;
+                    if (std::getline(label_stream, label)) {
+                        label.erase(label.find_last_not_of(" \n\r\t") + 1);
 
-                                                if (input_stream >> raw_temp) {
-                                                    double temp_c = raw_temp / 1000.0;
-                                                    core_temps[label] = temp_c;
-                                                }
-                                            }
-                                        }
+                        std::string input_file = label_file;
+                        size_t label_pos = input_file.find("_label");
+                        if (label_pos != std::string::npos) {
+                            input_file.replace(label_pos, 6, "_input");
+
+                            if (fs::exists(input_file)) {
+                                std::ifstream input_stream(input_file);
+                                int64_t raw_temp = 0;
+                                if (input_stream >> raw_temp) {
+                                    double temp_c = raw_temp / 1000.0;
+                                    if (temp_c > 0 && temp_c < 150) {
+                                        core_temps[label] = temp_c;
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                // ARM 平台可能没有 _label 文件，直接读 temp*_input
+                if (entry_name.find("temp") == 0 &&
+                    entry_name.find("_input") != std::string::npos &&
+                    entry_name.find("_label") == std::string::npos) {
+
+                    // 检查对应的 _label 是否存在，已有则跳过（上面已处理）
+                    std::string label_check = temp_entry.path().string();
+                    size_t input_pos = label_check.find("_input");
+                    if (input_pos != std::string::npos) {
+                        std::string corresponding_label = label_check;
+                        corresponding_label.replace(input_pos, 6, "_label");
+                        if (fs::exists(corresponding_label)) continue;
+                    }
+
+                    std::ifstream input_stream(temp_entry.path().string());
+                    int64_t raw_temp = 0;
+                    if (input_stream >> raw_temp) {
+                        double temp_c = raw_temp / 1000.0;
+                        if (temp_c > 0 && temp_c < 150) {
+                            // 用驱动名+传感器编号作为标签
+                            std::string synth_label = driver_name + "/" + entry_name;
+                            synth_label = synth_label.substr(0, synth_label.find("_input"));
+                            core_temps[synth_label] = temp_c;
                         }
                     }
                 }
@@ -249,10 +270,14 @@ static bool is_cpu_temp_type(const std::string& type) {
     // 常见的 CPU 温度类型标识
     static const std::vector<std::string> cpu_types = {
         "x86_pkg_temp",   // x86 CPU 包温度
-        "cpu",            // 通用 CPU 标识
         "coretemp",       // coretemp 驱动
+        "cpu-therm",      // NVIDIA Jetson/Thor CPU 温度
         "cpu_thermal",    // ARM CPU 热传感器
+        "tdiode_cpu",     // NVIDIA Tegra CPU diode
+        "tboard_cpu",     // NVIDIA board-level CPU temp
         "soc_thermal",    // SoC 热传感器
+        "soc-therm",      // NVIDIA SoC 热传感器
+        "cpu",            // 通用 CPU 标识 (放后面避免误匹配 "gpu" 等)
     };
 
     std::string lower_type = type;
@@ -307,62 +332,89 @@ static double get_cpu_temp_from_thermal_zone() {
     return 0.0;
 }
 
-// 获取 CPU 平均温度 (单位: 摄氏度)
+// 获取 CPU 整体温度 (单位: 摄氏度)
+// 整体温度的语义是"整颗 CPU 的温度"。Package 温度本就代表整颗芯片, 应优先采用;
+// 不能把 Package 温度和各核心温度混在一起平均(会把两种不同含义的测量值搅在一起,
+// 且 Package 通常偏高, 拉高整体读数)。
 double get_cpu_temp() {
-    std::vector<double> valid_temps;
-
-    // 优先从 coretemp 驱动读取核心温度
     auto core_temps = get_core_temperatures();
 
+    double result = 0.0;
+
     if (!core_temps.empty()) {
+        // 优先: Package 温度 (多路 CPU 时取各 Package 平均)
+        std::vector<double> package_temps;
+        std::vector<double> per_core_temps;
         for (const auto& [label, temp] : core_temps) {
-            if (label.find("Core") != std::string::npos ||
-                label.find("Package") != std::string::npos) {
-                if (temp > 0 && temp < 150) {
-                    valid_temps.push_back(temp);
-                }
+            if (temp <= 0 || temp >= 150) continue;
+            if (label.find("Package") != std::string::npos) {
+                package_temps.push_back(temp);
+            } else if (label.find("Core") != std::string::npos) {
+                per_core_temps.push_back(temp);
+            } else {
+                // ARM 等合成标签, 归入 per_core 作为兜底来源
+                per_core_temps.push_back(temp);
             }
         }
-    }
 
-    // 如果 coretemp 未找到，尝试 thermal_zone
-    if (valid_temps.empty()) {
-        double tz_temp = get_cpu_temp_from_thermal_zone();
-        if (tz_temp > 0) {
-            valid_temps.push_back(tz_temp);
+        if (!package_temps.empty()) {
+            result = std::accumulate(package_temps.begin(), package_temps.end(), 0.0) / package_temps.size();
+        } else if (!per_core_temps.empty()) {
+            result = std::accumulate(per_core_temps.begin(), per_core_temps.end(), 0.0) / per_core_temps.size();
         }
     }
 
-    // 计算平均温度
-    if (!valid_temps.empty()) {
-        double sum = std::accumulate(valid_temps.begin(), valid_temps.end(), 0.0);
-        double avg_temp = sum / valid_temps.size();
-
-        // 应用温度平滑
-        return g_temp_smoother.smooth(avg_temp);
+    // 兜底: thermal_zone
+    if (result <= 0) {
+        double tz_temp = get_cpu_temp_from_thermal_zone();
+        if (tz_temp > 0) result = tz_temp;
     }
 
+    if (result > 0) {
+        return g_temp_smoother.smooth(result);
+    }
     return 0.0;
+}
+
+// 逻辑 CPU -> 物理核心 ID 映射
+// coretemp 的 "Core N" 标签使用的是物理核心 ID, 而非逻辑 CPU 编号。
+// 超线程下逻辑 CPU 0/1 可能同属物理 Core 0, 必须用 topology/core_id 做映射。
+int get_physical_core_id(int cpu_id) {
+    std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu_id) + "/topology/core_id";
+    std::ifstream file(path);
+    int id = -1;
+    if (file.is_open()) file >> id;
+    return id;
 }
 
 // 获取单个核心的温度 (单位: 摄氏度)
 double get_core_temp(int core_id) {
     auto core_temps = get_core_temperatures();
 
-    // 尝试匹配 "Core N" 标签
-    std::string target_label = "Core " + std::to_string(core_id);
-    if (core_temps.find(target_label) != core_temps.end()) {
-        return core_temps[target_label];
-    }
-
-    // 备用: 如果找不到特定核心温度，返回 Package 温度
-    for (const auto& [label, temp] : core_temps) {
-        if (label.find("Package") != std::string::npos) {
-            return temp;
+    if (!core_temps.empty()) {
+        // x86: 把逻辑 CPU 映射到物理核心 ID 后匹配 "Core N" 标签
+        int phys = get_physical_core_id(core_id);
+        if (phys >= 0) {
+            auto it = core_temps.find("Core " + std::to_string(phys));
+            if (it != core_temps.end()) return it->second;
         }
+
+        // 兜底1: 直接用逻辑编号匹配 (拓扑信息不可用时)
+        auto it = core_temps.find("Core " + std::to_string(core_id));
+        if (it != core_temps.end()) return it->second;
+
+        // 兜底2: Package 温度 (x86)
+        for (const auto& [label, temp] : core_temps) {
+            if (label.find("Package") != std::string::npos) return temp;
+        }
+
+        // 兜底3: 第一个有效温度 (ARM 合成标签)
+        return core_temps.begin()->second;
     }
 
-    return 0.0;
+    // 兜底4: hwmon 无 CPU 温度 (NVIDIA Thor/Tegra 等) -> 使用 thermal_zone 的 CPU 温度
+    // ARM 平台通常没有逐核心传感器, 各核心共享同一 SoC/CPU 温度
+    return get_cpu_temp_from_thermal_zone();
 }
 
 // 解析核心列表，例如: "0,1,2" 或 "0-3"
@@ -411,7 +463,7 @@ int main(int argc, char* argv[]) {
             core_config.use_all_cores = false;
         }
         if (arg.find("--power=") == 0) {
-            std::string power_str = arg.substr(8);  // 提取 "--power=" 后的内容
+            std::string power_str = arg.substr(8);
             try {
                 int power = std::stoi(power_str);
                 if (power >= 0 && power <= 100) {
@@ -436,10 +488,16 @@ int main(int argc, char* argv[]) {
                   << "  --no-plot            Skip plot generation\n"
                   << "  --no-csv             Skip CSV export\n"
                   << "  --help, -h           Show this help message\n"
+                  << "\nHow --power works:\n"
+                  << "  --power=P pins the CPU frequency at P% of the [min,max] range and runs full load.\n"
+                  << "  Frequency stays STABLE; power consumption scales with the fixed frequency.\n"
+                  << "  Requires root (sudo) to write cpufreq sysfs. htop will show ~100% utilization by\n"
+                  << "  design (the cores are fully busy, only their clock speed is capped).\n"
                   << "\nExamples:\n"
-                  << "  " << argv[0] << "                    # Use all cores at 100% power\n"
-                  << "  " << argv[0] << " --power=50           # Use all cores at 50% power\n"
-                  << "  " << argv[0] << " --cores=0-3 --power=75  # Use cores 0-3 at 75% power\n";
+                  << "  sudo " << argv[0] << "                     # All cores at 100% (max frequency)\n"
+                  << "  sudo " << argv[0] << " --power=70           # Pin freq at 70% of range, stable freq\n"
+                  << "  sudo " << argv[0] << " --power=50           # Pin freq at 50% of range\n"
+                  << "  sudo " << argv[0] << " --cores=0-3 --power=75 # Cores 0-3, freq pinned at 75%\n";
         return 0;
     }
 
@@ -463,66 +521,130 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // --- 设置 CPU Governor 为 performance 模式 ---
-    // 这是解决频率跳变的关键：powersave 模式会根据负载动态调整频率
-    // performance 模式会锁定频率在最大值，保证稳定
+    // --- 频率控制 ---
+    // 要在降功耗的同时保持频率稳定, 唯一物理可行的方法是: 把频率钉在一个固定的中间值,
+    // 然后让核心满载运行。--power=P 即把频率锁定到 [min,max] 区间的 P% 处。
+    auto read_sysfs = [](const std::string& path) -> std::string {
+        std::ifstream f(path);
+        std::string val;
+        if (f.is_open() && std::getline(f, val)) {
+            val.erase(val.find_last_not_of(" \n\r\t") + 1);
+        }
+        return val;
+    };
+
+    auto write_sysfs = [](const std::string& path, const std::string& val) -> bool {
+        std::ofstream f(path);
+        if (f.is_open()) {
+            f << val;
+            f.close();
+            return f.good();
+        }
+        return false;
+    };
+
+    // 恢复用的原始状态
     std::string original_governor;
+    std::vector<std::string> original_min_freqs(num_cores);
+    std::vector<std::string> original_max_freqs(num_cores);
     bool governor_changed = false;
+    bool freq_capped = false;       // 修改了 scaling_min/max_freq
 
+    // 读取硬件频率范围
+    long fmin_khz = 0, fmax_khz = 0;
     {
-        // 读取当前 governor（从 cpu0）
-        std::ifstream gov_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
-        if (gov_file.is_open()) {
-            std::getline(gov_file, original_governor);
-            // 去除空白
-            original_governor.erase(original_governor.find_last_not_of(" \n\r\t") + 1);
+        std::string s_min = read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq");
+        std::string s_max = read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq");
+        try { if (!s_min.empty()) fmin_khz = std::stol(s_min); } catch (...) {}
+        try { if (!s_max.empty()) fmax_khz = std::stol(s_max); } catch (...) {}
+    }
+
+    bool cpufreq_available = (fmin_khz > 0 && fmax_khz > 0);
+
+    // 决定目标频率: power=100 -> 最大频率; 否则 -> 区间内 power% 处
+    long target_khz = fmax_khz;
+    if (g_power_percent < 100 && cpufreq_available) {
+        target_khz = fmin_khz + (long)((fmax_khz - fmin_khz) * (double)g_power_percent / 100.0);
+
+        // 若有可用频率档位列表, 吸附到最接近的合法档位
+        std::string avail = read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies");
+        if (!avail.empty()) {
+            std::stringstream ss(avail);
+            std::string tok;
+            long best = target_khz, best_diff = -1;
+            while (ss >> tok) {
+                try {
+                    long f = std::stol(tok);
+                    long d = std::labs(f - target_khz);
+                    if (best_diff < 0 || d < best_diff) { best_diff = d; best = f; }
+                } catch (...) {}
+            }
+            target_khz = best;
+        }
+    }
+
+    // 保存当前 governor
+    original_governor = read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+
+    bool freq_lock_mode = (g_power_percent < 100 && cpufreq_available);
+
+    if (cpufreq_available) {
+        // 把 scaling_min_freq 与 scaling_max_freq 同时钉到 target, 强制锁频
+        // 这是跨驱动通用方案: 对 acpi-cpufreq / intel_pstate 都有效
+        // 注意: scaling_max_freq 本身已对频率封顶(含 turbo 范围内), 无需也不应关闭 turbo,
+        //       否则会把频率限制在基础频率, 导致 100% 时上不去最高频。
+        bool all_ok = true;
+        for (int i = 0; i < num_cores; ++i) {
+            std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/";
+            original_min_freqs[i] = read_sysfs(base + "scaling_min_freq");
+            original_max_freqs[i] = read_sysfs(base + "scaling_max_freq");
+            // 先抬 max 再压 min, 避免 min>max 的写入被拒
+            bool ok1 = write_sysfs(base + "scaling_max_freq", std::to_string(target_khz));
+            bool ok2 = write_sysfs(base + "scaling_min_freq", std::to_string(target_khz));
+            if (!ok1 || !ok2) all_ok = false;
         }
 
-        if (original_governor != "performance") {
-            // 尝试为所有核心设置 performance governor
-            bool all_success = true;
-            for (int i = 0; i < num_cores; ++i) {
-                std::string gov_path = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_governor";
-                std::ofstream set_gov(gov_path);
-                if (set_gov.is_open()) {
-                    set_gov << "performance";
-                    set_gov.close();
-                } else {
-                    all_success = false;
-                }
-            }
+        // 验证: 驱动可能把写入值吸附到最近的合法档位, 因此只要 min==max(钉到单点)即视为成功
+        long rmin = 0, rmax = 0;
+        try { rmin = std::stol(read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq")); } catch (...) {}
+        try { rmax = std::stol(read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq")); } catch (...) {}
 
-            if (all_success) {
-                // 验证是否设置成功
-                bool verified = true;
-                for (int i = 0; i < num_cores; ++i) {
-                    std::string gov_path = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_governor";
-                    std::ifstream check_gov(gov_path);
-                    std::string new_gov;
-                    if (check_gov.is_open() && std::getline(check_gov, new_gov)) {
-                        new_gov.erase(new_gov.find_last_not_of(" \n\r\t") + 1);
-                        if (new_gov != "performance") {
-                            verified = false;
-                            break;
-                        }
-                    } else {
-                        verified = false;
-                        break;
-                    }
-                }
-
-                if (verified) {
-                    governor_changed = true;
-                    std::cout << "CPU Governor set to 'performance' mode for all " << num_cores << " cores (was: " << original_governor << ")\n";
-                }
-            }
-
-            if (!governor_changed) {
-                std::cout << "Warning: Could not set CPU governor to 'performance'.\n";
-                std::cout << "         CPU frequency may fluctuate. Run with 'sudo' to enable performance mode.\n";
-                std::cout << "         Or manually run: sudo cpupower frequency-set -g performance\n";
+        if (all_ok && rmin > 0 && rmin == rmax) {
+            freq_capped = true;
+            long actual_mhz = rmin / 1000;  // 实际生效频率(可能被驱动吸附)
+            if (freq_lock_mode) {
+                std::cout << "[Freq Lock] Pinned to " << actual_mhz << " MHz "
+                          << "(range " << fmin_khz / 1000 << "-" << fmax_khz / 1000 << " MHz, "
+                          << "target " << g_power_percent << "%), running FULL load.\n";
+            } else {
+                std::cout << "[Freq Lock] Pinned to " << actual_mhz << " MHz (max).\n";
             }
         }
+    }
+
+    // 频率钉死失败时, 尝试 governor=performance 作为兜底 (至少 power=100 场景稳定)
+    if (!freq_capped && original_governor != "performance") {
+        bool all_ok = true;
+        for (int i = 0; i < num_cores; ++i) {
+            std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_governor";
+            if (!write_sysfs(path, "performance")) all_ok = false;
+        }
+        if (all_ok && read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") == "performance") {
+            governor_changed = true;
+            std::cout << "[Freq Lock] Governor -> performance (freq pin unavailable)\n";
+        }
+    }
+
+    if (!freq_capped && !governor_changed && original_governor != "performance") {
+        std::cout << "\n"
+                  << "WARNING: Failed to control CPU frequency (need root). Frequency WILL fluctuate.\n"
+                  << "  Run with: sudo " << argv[0] << " --power=" << g_power_percent << "\n"
+                  << "\n";
+    }
+    if (freq_lock_mode && !freq_capped) {
+        std::cout << "Note: Could not pin frequency (need root). Cores will run at full load and the\n"
+                  << "      governor will drive frequency freely -- effective power will be ~100%, not "
+                  << g_power_percent << "%.\n";
     }
 
     std::cout << "Detected " << num_cores << " cores total.\n";
@@ -534,8 +656,11 @@ int main(int argc, char* argv[]) {
     std::cout << "\n";
     if (g_power_percent == 100) {
         std::cout << "Power mode: Full power (100%)\n";
+    } else if (freq_capped) {
+        std::cout << "Power mode: " << g_power_percent << "% (frequency-lock, stable freq, full load)\n";
     } else {
-        std::cout << "Power mode: " << g_power_percent << "% power\n";
+        std::cout << "Power mode: " << g_power_percent << "% requested, but frequency lock unavailable "
+                  << "(running full load at governor-driven frequency)\n";
     }
     std::cout << "Starting stress test... Press [Ctrl+C] to stop and generate plots.\n";
 
@@ -795,6 +920,7 @@ int main(int argc, char* argv[]) {
             plt::title("CPU Core Frequency History");
             plt::ylabel("Frequency (MHz)");
             plt::ylim(0.0, freq_max);
+            plt::legend();
             plt::grid(true);
 
             // 子图3: 核心温度
@@ -817,6 +943,7 @@ int main(int argc, char* argv[]) {
             plt::title("Per-Core Temperature History");
             plt::ylabel("Temperature (C)");
             plt::ylim(temp_min - 5, temp_max + 5);
+            plt::legend();
             plt::grid(true);
 
             // 子图4: 总体温度
@@ -845,21 +972,26 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    // --- 恢复 CPU Governor 设置 ---
-    if (governor_changed && !original_governor.empty()) {
-        bool restore_success = true;
+    // --- 恢复 CPU 频率设置 ---
+    if (freq_capped) {
+        bool ok = true;
         for (int i = 0; i < num_cores; ++i) {
-            std::string gov_path = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_governor";
-            std::ofstream set_gov(gov_path);
-            if (set_gov.is_open()) {
-                set_gov << original_governor;
-            } else {
-                restore_success = false;
-            }
+            std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/";
+            // 先恢复 max, 再恢复 min, 避免约束冲突
+            if (!original_max_freqs[i].empty())
+                if (!write_sysfs(base + "scaling_max_freq", original_max_freqs[i])) ok = false;
+            if (!original_min_freqs[i].empty())
+                if (!write_sysfs(base + "scaling_min_freq", original_min_freqs[i])) ok = false;
         }
-        if (restore_success) {
-            std::cout << "CPU Governor restored to '" << original_governor << "' for all " << num_cores << " cores\n";
+        if (ok) std::cout << "scaling_min/max_freq restored\n";
+    }
+    if (governor_changed && !original_governor.empty()) {
+        bool ok = true;
+        for (int i = 0; i < num_cores; ++i) {
+            if (!write_sysfs("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_governor", original_governor))
+                ok = false;
         }
+        if (ok) std::cout << "Governor restored to '" << original_governor << "'\n";
     }
 
     std::cout << "\nDone!\n";
